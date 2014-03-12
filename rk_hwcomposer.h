@@ -29,11 +29,11 @@
 #include <hardware/rga.h>
 #include <utils/Thread.h>
 #include <linux/fb.h>
-
+#include "hwc_ipp.h"
 #define hwcDEBUG 0
 #define hwcUseTime 0
 #define hwcBlitUseTime 0
-#define hwcDumpSurface 1
+#define hwcDumpSurface 0
 #define  ENABLE_HWC_WORMHOLE     1
 #define  DUMP_SPLIT_AREA   0
 #define FB1_IOCTL_SET_YUV_ADDR	0x5002
@@ -41,6 +41,22 @@
 //#define USE_LCDC_COMPOSER
 #define USE_HW_VSYNC        1
 #define FBIOSET_OVERLAY_STATE     	0x5018
+#define bakupbufsize 4
+
+#ifdef TARGET_BOARD_PLATFORM_RK30XXB
+ #define GPU_BASE    handle->iBase
+ #define GPU_WIDTH   handle->iWidth
+ #define GPU_HEIGHT  handle->iHeight
+ #define GPU_FORMAT  handle->iFormat
+ #define GPU_DST_FORMAT  DstHandle->iFormat
+ #define private_handle_t IMG_native_handle_t
+#else
+ #define GPU_BASE    handle->base
+ #define GPU_WIDTH   handle->width
+ #define GPU_HEIGHT  handle->height
+ #define GPU_FORMAT  handle->format
+ #define GPU_DST_FORMAT  DstHandle->format
+#endif
 /* Set it to 1 to enable swap rectangle optimization;
  * Set it to 0 to disable. */
 /* Set it to 1 to enable pmem cache flush.
@@ -53,20 +69,9 @@
 extern "C" {
 #endif
 
-struct private_handle_t;
-#ifdef TARGET_BOARD_PLATFORM_RK30XXB
-#define private_handle_t IMG_native_handle_t
-#define format iFormat
-#define width iWidth
-#define height iHeight
-#endif
 
 #if PLATFORM_SDK_VERSION >= 17
-#define  hwc_composer_device_t 	hwc_composer_device_1_t
-#define  hwc_layer_t           	hwc_layer_1_t
 
-#define  hwc_composer_device 	hwc_composer_device_1
-#define  hwc_layer           	hwc_layer_1
 #define  hwc_layer_list_t	 	hwc_display_contents_1_t
 #endif
 enum
@@ -79,6 +84,7 @@ enum
     HWC_BLITTER = 100,
     HWC_DIM,
     HWC_CLEAR_HOLE
+    
 };
 
 
@@ -103,6 +109,37 @@ typedef struct _hwcRECT
 }
 hwcRECT;
 
+typedef struct _hwbkupinfo
+{
+    unsigned int pmem_bk;
+    unsigned int buf_addr;
+    void* pmem_bk_log;
+    void* buf_addr_log;
+    int xoffset;
+    int yoffset;
+    int w_vir;
+    int h_vir;
+    int w_act;
+    int h_act;
+    int format;
+}
+hwbkupinfo;
+typedef struct _hwbkupmanage
+{
+    int count;
+    unsigned int direct_addr;
+    void* direct_addr_log;    
+    int invalid;
+    int needrev;
+    int dstwinNo;
+    int skipcnt;
+    unsigned int ckpstcnt;
+	char LayerName[LayerNameLength + 1];    
+    unsigned int crrent_dis_addr;
+    hwbkupinfo bkupinfo[bakupbufsize];
+    struct private_handle_t *handle_bk;
+}
+hwbkupmanage;
 #define IN
 #define OUT
 
@@ -133,10 +170,49 @@ struct hwcAreaPool
     hwcAreaPool *                    next;
 };
 
+struct DisplayAttributes {
+    uint32_t vsync_period; //nanos
+    uint32_t xres;
+    uint32_t yres;
+    uint32_t stride;
+    float xdpi;
+    float ydpi;
+    int fd;
+	int fd1;
+	int fd2;
+	int fd3;
+    bool connected; //Applies only to pluggable disp.
+    //Connected does not mean it ready to use.
+    //It should be active also. (UNBLANKED)
+    bool isActive;
+    // In pause state, composition is bypassed
+    // used for WFD displays only
+    bool isPause;
+};
 
+typedef struct tVPU_FRAME
+{
+    uint32_t          FrameBusAddr[2];    // 0: Y address; 1: UV address;
+    uint32_t         FrameWidth;         // 16 aligned frame width
+    uint32_t         FrameHeight;        // 16 aligned frame height
+};
+
+typedef struct 
+{
+   tVPU_FRAME vpu_frame;
+   void*      vpu_handle;
+} vpu_frame_t;
+
+typedef struct
+{
+  ion_buffer_t *pion;
+  ion_device_t *ion_device; 
+  unsigned int  offset;
+  unsigned int  last_offset;
+} hwc_ion_t;
 typedef struct _hwcContext
 {
-    hwc_composer_device_t device;
+    hwc_composer_device_1_t device;
 
     /* Reference count. Normally: 1. */
     unsigned int reference;
@@ -157,18 +233,28 @@ typedef struct _hwcContext
     int       fbHeight;
     bool      fb1_cflag;
     char      cupcore_string[16];
+    hwc_ion_t      hwc_ion;
+    DisplayAttributes              dpyAttr[HWC_NUM_DISPLAY_TYPES];
+     struct                         fb_var_screeninfo info;
 
     hwc_procs_t *procs;
-
+    ipp_device_t *ippDev;
     pthread_t hdmi_thread;
     pthread_mutex_t lock;
     nsecs_t         mNextFakeVSync;
     float           fb_fps;
     unsigned int fbPhysical;
     unsigned int fbStride;
+    ion_device_t *rk_ion_device;
+    ion_buffer_t *pion;
+	int          wfdOptimize;
     /* PMEM stuff. */
     unsigned int pmemPhysical;
     unsigned int pmemLength;
+	vpu_frame_t  video_frame;
+	unsigned int fbSize;
+	unsigned int lcdSize;
+	char *pbakupbuf[bakupbufsize];
 #if ENABLE_HWC_WORMHOLE
     /* Splited composition area queue. */
     hwcArea *                        compositionArea;
@@ -177,6 +263,7 @@ typedef struct _hwcContext
     hwcAreaPool                      areaPool;
 #endif
      int      flag;
+    bool IsRk3188;  
 }
 hwcContext;
 
@@ -214,7 +301,7 @@ hwcContext;
 hwcSTATUS
 hwcBlit(
     IN hwcContext * Context,
-    IN hwc_layer_t * Src,
+    IN hwc_layer_1_t * Src,
     IN struct private_handle_t * DstHandle,
     IN hwc_rect_t * SrcRect,
     IN hwc_rect_t * DstRect,
@@ -225,7 +312,7 @@ hwcBlit(
 hwcSTATUS
 hwcDim(
     IN hwcContext * Context,
-    IN hwc_layer_t * Src,
+    IN hwc_layer_1_t * Src,
     IN struct private_handle_t * DstHandle,
     IN hwc_rect_t * DstRect,
     IN hwc_region_t * Region
@@ -234,7 +321,7 @@ hwcDim(
 hwcSTATUS
 hwcLayerToWin(
     IN hwcContext * Context,
-    IN hwc_layer_t * Src,
+    IN hwc_layer_1_t * Src,
     IN struct private_handle_t * DstHandle,
     IN hwc_rect_t * SrcRect,
 	IN hwc_rect_t * DstRect,
