@@ -22,41 +22,74 @@
 
 /* Set 0 to enable LOGV message. See cutils/log.h */
 #include <cutils/log.h>
-
 #include <hardware/hwcomposer.h>
 //#include <ui/android_native_buffer.h>
 
 #include <hardware/rga.h>
 #include <utils/Thread.h>
 #include <linux/fb.h>
-#include "hwc_ipp.h"
-#define hwcDEBUG 0
-#define hwcUseTime 0
-#define hwcBlitUseTime 0
-#define hwcDumpSurface 0
-#define  ENABLE_HWC_WORMHOLE     1
-#define  DUMP_SPLIT_AREA   0
-#define FB1_IOCTL_SET_YUV_ADDR	0x5002
-#define RK_FBIOSET_VSYNC_ENABLE     0x4629
-//#define USE_LCDC_COMPOSER
-#define USE_HW_VSYNC        1
-#define FBIOSET_OVERLAY_STATE     	0x5018
-#define bakupbufsize 4
+#include <hardware/gralloc.h>
+#include "../libgralloc_ump/gralloc_priv.h"
+#include "../libon2/vpu_global.h"
+#include "../libon2/vpu_mem.h"
 
-#ifdef TARGET_BOARD_PLATFORM_RK30XXB
- #define GPU_BASE    handle->iBase
- #define GPU_WIDTH   handle->iWidth
- #define GPU_HEIGHT  handle->iHeight
- #define GPU_FORMAT  handle->iFormat
- #define GPU_DST_FORMAT  DstHandle->iFormat
- #define private_handle_t IMG_native_handle_t
-#else
- #define GPU_BASE    handle->base
- #define GPU_WIDTH   handle->width
- #define GPU_HEIGHT  handle->height
- #define GPU_FORMAT  handle->format
- #define GPU_DST_FORMAT  DstHandle->format
-#endif
+//Control macro
+#define hwcDEBUG                    0
+#define hwcUseTime                  0
+#define hwcBlitUseTime              0
+#define hwcDumpSurface              0
+#define DUMP_AFTER_RGA_COPY_IN_GPU_CASE 0
+#define DEBUG_CHECK_WIN_CFG_DATA    0     //check rk_fb_win_cfg_data for lcdc
+#define ENABLE_HWC_WORMHOLE         1
+#define DUMP_SPLIT_AREA             0
+#define SYNC_IN_VIDEO               0
+#define USE_HWC_FENCE               1
+#define USE_QUEUE_DDRFREQ           1
+#define USE_VIDEO_BACK_BUFFERS      1
+#define USE_SPECIAL_COMPOSER        0
+#define ENABLE_LCDC_IN_NV12_TRANSFORM   1   //1: It will need reserve a phyical memory for transform.
+#define USE_HW_VSYNC                1
+#define WRITE_VPU_FRAME_DATA        0
+#define MOST_WIN_ZONES              4
+#define ENBALE_WIN_ANY_ZONES        0
+#define ENABLE_TRANSFORM_BY_RGA     1               //1: It will need reserve a phyical memory for transform.
+#define OPTIMIZATION_FOR_TRANSFORM_UI   1
+
+//Command macro
+#define FB1_IOCTL_SET_YUV_ADDR	    0x5002
+#define RK_FBIOSET_VSYNC_ENABLE     0x4629
+#define RK_FBIOSET_DMABUF_FD	    0x5004
+#define RK_FBIOGET_DSP_FD     	    0x4630
+#define RK_FBIOGET_LIST_STAT   		0X4631
+//#define USE_LCDC_COMPOSER
+#define FBIOSET_OVERLAY_STATE     	0x5018
+#define RK_FBIOGET_IOMMU_STA        0x4632
+
+//Amount macro
+#define MaxZones                    10
+#define bakupbufsize                4
+#define MaxVideoBackBuffers         (3)
+#define MAX_VIDEO_SOURCE            (5)
+#define GPUDRAWCNT                  (10)
+
+//Other macro
+#define GPU_BASE        handle->base
+#define GPU_WIDTH       handle->width
+#define GPU_HEIGHT      handle->height
+#define GPU_FORMAT      handle->format
+#define GPU_DST_FORMAT  DstHandle->format
+
+#define GHWC_VERSION  "2.010"
+//HWC version Tag
+//Get commit info:  git log --format="Author: %an%nTime:%cd%nCommit:%h%n%n%s%n%n"
+//Get version: busybox strings /system/lib/hw/hwcomposer.rk30board.so | busybox grep HWC_VERSION
+//HWC_VERSION Author:zxl Time:Tue Aug 12 17:27:36 2014 +0800 Version:1.17 Branch&Previous-Commit:rk/rk312x/mid/4.4_r1/develop-9533348.
+#define HWC_VERSION "HWC_VERSION  \
+Author:zxl \
+Previous-Time:Tue Nov 18 09:53:31 2014 +0800 \
+Version:2.010 \
+Branch&Previous-Commit:rk/rk32/mid/4.4_r1/develop-6e5eaff."
+
 /* Set it to 1 to enable swap rectangle optimization;
  * Set it to 0 to disable. */
 /* Set it to 1 to enable pmem cache flush.
@@ -88,6 +121,15 @@ enum
 };
 
 
+
+typedef struct _mix_info
+{
+    int gpu_draw_fd[GPUDRAWCNT];
+    int alpha[GPUDRAWCNT];
+
+}
+mix_info;
+
 typedef enum _hwcSTATUS
 {
 	hwcSTATUS_OK					= 	 0,
@@ -109,8 +151,85 @@ typedef struct _hwcRECT
 }
 hwcRECT;
 
+typedef enum _hwc_lcdc_res
+{
+	win0				= 1,
+	win1                = 2,
+	win2_0              = 3,   
+	win2_1              = 4,
+	win2_2              = 5,
+	win2_3              = 6,   
+	win3_0              = 7,
+	win3_1              = 8,
+	win3_2              = 9,
+	win3_3              = 10,
+	win_ext             = 11,
+
+}
+hwc_lcdc_res;
+
+typedef struct _ZoneInfo
+{
+    unsigned int        stride;
+    unsigned int        width;
+    unsigned int        height;
+    hwc_rect_t  src_rect;
+    hwc_rect_t  disp_rect;
+    struct private_handle_t *handle;      
+	int         layer_fd;
+	int         direct_fd;
+	unsigned int addr;
+	int         zone_alpha;
+	int         blend;
+	bool        is_stretch;
+	int         is_large;
+	int         size;
+	float       hfactor;
+	int         format;
+	int         zone_index;
+	int         layer_index;
+	int         transform;
+	int         realtransform;
+	int         layer_flag;
+	int         dispatched;
+	int         sort;
+	char        LayerName[LayerNameLength + 1];   
+#ifdef USE_HWC_FENCE
+    int         acq_fence_fd;
+#endif
+}
+ZoneInfo;
+
+typedef struct _ZoneManager
+{
+    ZoneInfo    zone_info[MaxZones];
+    int         bp_size;
+    int         zone_cnt;   
+    int         composter_mode;        
+	        
+}
+ZoneManager;
+typedef struct _vop_info
+{
+    int         state;   // 1:on ,0:off
+	int         zone_num;  // nums    
+	int         reserve;
+	int         reserve2;	
+}
+vop_info;
+typedef struct _BpVopInfo
+{
+    vop_info    vopinfo[4];
+    int         bp_size; // toatl size
+    int         bp_vop_size;    // vop size
+}
+BpVopInfo;
+
 typedef struct _hwbkupinfo
 {
+    buffer_handle_t phd_bk;
+    int membk_fd;
+    int buf_fd;
     unsigned int pmem_bk;
     unsigned int buf_addr;
     void* pmem_bk_log;
@@ -127,15 +246,19 @@ hwbkupinfo;
 typedef struct _hwbkupmanage
 {
     int count;
+    buffer_handle_t phd_drt;    
+    int          direct_fd;
+    int          direct_base;
     unsigned int direct_addr;
     void* direct_addr_log;    
     int invalid;
     int needrev;
     int dstwinNo;
     int skipcnt;
-    unsigned int ckpstcnt;
+    unsigned int ckpstcnt;    
+    unsigned int inputspcnt;    
 	char LayerName[LayerNameLength + 1];    
-    unsigned int crrent_dis_addr;
+    unsigned int crrent_dis_fd;
     hwbkupinfo bkupinfo[bakupbufsize];
     struct private_handle_t *handle_bk;
 }
@@ -190,26 +313,30 @@ struct DisplayAttributes {
     bool isPause;
 };
 
-typedef struct tVPU_FRAME
+struct tVPU_FRAME_v2
 {
-    uint32_t          FrameBusAddr[2];    // 0: Y address; 1: UV address;
-    uint32_t         FrameWidth;         // 16 aligned frame width
-    uint32_t         FrameHeight;        // 16 aligned frame height
+    uint32_t         videoAddr[2];    // 0: Y address; 1: UV address;
+    uint32_t         width;         // 16 aligned frame width
+    uint32_t         height;        // 16 aligned frame height
+    uint32_t         format;        // 16 aligned frame height
 };
+
+
 
 typedef struct 
 {
-   tVPU_FRAME vpu_frame;
+   tVPU_FRAME_v2 vpu_frame;
    void*      vpu_handle;
 } vpu_frame_t;
 
-typedef struct
+typedef struct _videoCacheInfo
 {
-  ion_buffer_t *pion;
-  ion_device_t *ion_device; 
-  unsigned int  offset;
-  unsigned int  last_offset;
-} hwc_ion_t;
+    struct private_handle_t* video_hd;
+    struct private_handle_t* vui_hd;
+    void * video_base;
+    bool bMatch;
+}videoCacheInfo;
+
 typedef struct _hwcContext
 {
     hwc_composer_device_1_t device;
@@ -229,24 +356,25 @@ typedef struct _hwcContext
     int       fbFd;
     int       fbFd1;
     int       vsync_fd;
-    int       fbWidth;
-    int       fbHeight;
+    int       ddrFd;
+    videoCacheInfo video_info[MAX_VIDEO_SOURCE];
+    int vui_fd;
+    int vui_hide;
+
+    int video_fmt;
+    struct private_handle_t fbhandle ;    
     bool      fb1_cflag;
     char      cupcore_string[16];
-    hwc_ion_t      hwc_ion;
     DisplayAttributes              dpyAttr[HWC_NUM_DISPLAY_TYPES];
-     struct                         fb_var_screeninfo info;
+    struct                         fb_var_screeninfo info;
 
     hwc_procs_t *procs;
-    ipp_device_t *ippDev;
     pthread_t hdmi_thread;
     pthread_mutex_t lock;
     nsecs_t         mNextFakeVSync;
     float           fb_fps;
     unsigned int fbPhysical;
     unsigned int fbStride;
-    ion_device_t *rk_ion_device;
-    ion_buffer_t *pion;
 	int          wfdOptimize;
     /* PMEM stuff. */
     unsigned int pmemPhysical;
@@ -254,7 +382,10 @@ typedef struct _hwcContext
 	vpu_frame_t  video_frame;
 	unsigned int fbSize;
 	unsigned int lcdSize;
-	char *pbakupbuf[bakupbufsize];
+	int           iommuEn;
+    alloc_device_t  *mAllocDev;	
+	ZoneManager  zone_manager;;
+
 #if ENABLE_HWC_WORMHOLE
     /* Splited composition area queue. */
     hwcArea *                        compositionArea;
@@ -262,10 +393,31 @@ typedef struct _hwcContext
     /* Pre-allocated area pool. */
     hwcAreaPool                      areaPool;
 #endif
+    /* skip flag */
+     int      mSkipFlag;
      int      flag;
-    bool IsRk3188;  
+     int      fb_blanked;
+
+    /* video flag */
+     bool      mVideoMode;
+     bool      mNV12_VIDEO_VideoMode;
+     bool      mIsMediaView;
+     bool      mVideoRotate;
+     bool      mGtsStatus;
+     bool      mTrsfrmbyrga;
+     int        mtrsformcnt;       
+
+     /* The index of video buffer will be used */
+     int      mCurVideoIndex;
+     int      fd_video_bk[MaxVideoBackBuffers];
+     int      base_video_bk[MaxVideoBackBuffers];
+     buffer_handle_t pbvideo_bk[MaxVideoBackBuffers];
 }
 hwcContext;
+#define gcmALIGN(n, align) \
+( \
+    ((n) + ((align) - 1)) & ~((align) - 1) \
+)
 
 #define hwcMIN(x, y)			(((x) <= (y)) ?  (x) :  (y))
 #define hwcMAX(x, y)			(((x) >= (y)) ?  (x) :  (y))
@@ -349,6 +501,7 @@ hwcGetFormat(
     OUT RgaSURF_FORMAT * Format
     );
 
+int hwChangeRgaFormat(IN int fmt );
 hwcSTATUS
 hwcLockBuffer(
     IN  hwcContext *  Context,

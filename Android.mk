@@ -29,9 +29,7 @@ LOCAL_SRC_FILES := \
 	rk_hwcomposer_buffer.cpp \
 	rga_api.cpp \
 	rk_hwcomposer_hdmi.cpp \
-	hwc_ipp.cpp \
-	hwc_rga.cpp \
-	blend.S
+	hwc_rga.cpp 
 
 LOCAL_CFLAGS := \
 	$(CFLAGS) \
@@ -56,7 +54,7 @@ LOCAL_SHARED_LIBRARIES := \
 	libcutils \
 	libion \
 	libhardware_legacy \
-	libsync
+	libsync 
 
 
 
@@ -65,6 +63,10 @@ LOCAL_SHARED_LIBRARIES := \
 
 ifeq ($(strip $(TARGET_BOARD_PLATFORM)),rk30xxb)	
 LOCAL_CFLAGS += -DTARGET_BOARD_PLATFORM_RK30XXB
+endif
+
+ifeq ($(strip $(GRAPHIC_MEMORY_PROVIDER)),dma_buf)
+LOCAL_CFLAGS += -DUSE_DMA_BUF
 endif
 
 #LOCAL_CFLAGS += -DUSE_LCDC_COMPOSER
